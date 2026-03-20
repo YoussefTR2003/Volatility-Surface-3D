@@ -12,7 +12,10 @@ st.title("Option Volatility Surface")
 st.header(
     "Implied volatility is the market's expectation of how volatile the underlying asset will be in the future. "
     "It is derived from the price of an option and can be used to gauge market sentiment and make informed trading decisions."
+    "Volatility surfaces are 3D plots that show how implied volatility changes with different strike prices and expiration dates. "
+    "They can help traders identify patterns and potential trading opportunities."
 )
+
 
 @st.cache_data(ttl=600)
 def get_spot_price(ticker):
