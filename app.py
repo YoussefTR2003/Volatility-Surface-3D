@@ -19,6 +19,7 @@ def option_chains(ticker):
     expirations = asset.options
     chains = pd.DataFrame()
 
+    expirations = expirations[:5]  # max 5 maturités
     for expiration in expirations:
         opt = asset.option_chain(expiration)
 
@@ -114,6 +115,3 @@ try:
 
 except Exception as e:
     st.error(f"An error occurred: {e}")
-
-
-
