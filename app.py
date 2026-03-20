@@ -7,6 +7,7 @@ import time
 from mpl_toolkits.mplot3d import Axes3D
 
 st.set_page_config(layout="wide")
+
 st.title("Option Volatility Surface")
 st.header(
     "Implied volatility is the market's expectation of how volatile the underlying asset will be in the future. "
@@ -14,9 +15,18 @@ st.header(
 )
 
 @st.cache_data(ttl=600)
+def get_spot_price(ticker):
+    asset = yf.Ticker(ticker)
+    hist = asset.history(period="1d")
+    if hist.empty:
+        raise ValueError("Unable to retrieve spot price.")
+    return float(hist["Close"].iloc[-1])
+
+@st.cache_data(ttl=600)
 def get_expirations(ticker):
     asset = yf.Ticker(ticker)
-    return list(asset.options)
+    expirations = list(asset.options)
+    return expirations
 
 @st.cache_data(ttl=600)
 def get_option_chain(ticker, expiration):
@@ -32,12 +42,13 @@ def get_option_chain(ticker, expiration):
     chain = pd.concat([calls, puts], ignore_index=True)
     chain["expiration"] = pd.to_datetime(expiration) + pd.DateOffset(hours=23, minutes=59, seconds=59)
     chain["daysToExpiration"] = (chain["expiration"] - pd.Timestamp.today()).dt.days + 1
+
     return chain
 
 @st.cache_data(ttl=600)
 def get_surface_data(ticker, expirations):
-    frames = []
     asset = yf.Ticker(ticker)
+    frames = []
 
     for expiration in expirations:
         try:
@@ -53,15 +64,61 @@ def get_surface_data(ticker, expirations):
         except Exception:
             continue
 
-    if frames:
-        return pd.concat(frames, ignore_index=True)
-    return pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
+
+def clean_calls_data(df, spot):
+    df = df.copy()
+
+    numeric_cols = [
+        "strike", "impliedVolatility", "volume", "openInterest", "bid", "ask"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["strike", "impliedVolatility"])
+
+    # Remove absurd IV values
+    df = df[
+        (df["impliedVolatility"] > 0.01) &
+        (df["impliedVolatility"] < 2.0)
+    ]
+
+    # Keep only relatively liquid options
+    if {"volume", "openInterest"}.issubset(df.columns):
+        df = df[
+            (df["volume"].fillna(0) > 0) |
+            (df["openInterest"].fillna(0) > 10)
+        ]
+
+    # Basic bid/ask sanity checks if available
+    if {"bid", "ask"}.issubset(df.columns):
+        df = df[
+            (df["bid"].fillna(0) >= 0) &
+            (df["ask"].fillna(0) > 0) &
+            (df["ask"].fillna(0) >= df["bid"].fillna(0))
+        ]
+
+    # Restrict strikes around spot to avoid deep OTM junk
+    df = df[
+        (df["strike"] >= 0.7 * spot) &
+        (df["strike"] <= 1.3 * spot)
+    ]
+
+    return df
 
 with st.sidebar:
     st.header("Select an underlying asset")
     ticker = st.text_input("Enter a ticker symbol", value="SPY").upper()
+    max_expiries = st.slider("Number of expirations for surface", min_value=2, max_value=6, value=4)
 
 try:
+    spot = get_spot_price(ticker)
+    st.write(f"**Spot price:** {spot:.2f}")
+
     expirations = get_expirations(ticker)
 
     if not expirations:
@@ -70,34 +127,47 @@ try:
 
     selected_expiry_str = st.selectbox("Select expiration", expirations)
 
+    # Single expiry for skew
     options_one_expiry = get_option_chain(ticker, selected_expiry_str)
     calls_one_expiry = options_one_expiry[options_one_expiry["optionType"] == "call"].copy()
-    calls_one_expiry = calls_one_expiry[calls_one_expiry["impliedVolatility"] >= 0.001]
+    calls_one_expiry = clean_calls_data(calls_one_expiry, spot)
 
     if calls_one_expiry.empty:
-        st.error("No valid call options found for this expiration.")
+        st.error("No valid call options found for this expiration after cleaning.")
         st.stop()
 
     st.subheader("Implied Volatility Skew")
-    fig1, ax1 = plt.subplots(figsize=(7, 4))
-    calls_one_expiry[["strike", "impliedVolatility"]].set_index("strike").sort_index().plot(ax=ax1)
+    fig1, ax1 = plt.subplots(figsize=(8, 4))
+    (
+        calls_one_expiry[["strike", "impliedVolatility"]]
+        .dropna()
+        .sort_values("strike")
+        .set_index("strike")
+        .plot(ax=ax1, legend=False)
+    )
     ax1.set_title(f"Implied Volatility Skew - {selected_expiry_str}")
-    ax1.set_ylabel("Implied Volatility")
     ax1.set_xlabel("Strike")
+    ax1.set_ylabel("Implied Volatility")
     st.pyplot(fig1)
 
+    # Strike selector
     available_strikes = sorted(calls_one_expiry["strike"].dropna().unique())
     default_idx = min(len(available_strikes) // 2, len(available_strikes) - 1)
     selected_strike = st.selectbox("Select strike", available_strikes, index=default_idx)
 
-    limited_expirations = expirations[:5]
+    # Surface data
+    limited_expirations = expirations[:max_expiries]
     surface_calls = get_surface_data(ticker, limited_expirations)
 
     if surface_calls.empty:
         st.warning("Could not retrieve enough option data for term structure and surface.")
         st.stop()
 
-    surface_calls = surface_calls[surface_calls["impliedVolatility"] >= 0.001]
+    surface_calls = clean_calls_data(surface_calls, spot)
+
+    if surface_calls.empty:
+        st.warning("No valid surface data after cleaning.")
+        st.stop()
 
     st.subheader("Implied Volatility Term Structure")
     strike_slice = surface_calls[surface_calls["strike"] == selected_strike].copy()
@@ -105,26 +175,37 @@ try:
     if strike_slice.empty:
         st.warning("Selected strike is not available across enough expirations.")
     else:
-        fig2, ax2 = plt.subplots(figsize=(7, 4))
-        strike_slice[["expiration", "impliedVolatility"]].set_index("expiration").sort_index().plot(ax=ax2)
+        fig2, ax2 = plt.subplots(figsize=(8, 4))
+        (
+            strike_slice[["expiration", "impliedVolatility"]]
+            .dropna()
+            .sort_values("expiration")
+            .set_index("expiration")
+            .plot(ax=ax2, legend=False)
+        )
         ax2.set_title(f"Implied Volatility Term Structure - Strike {selected_strike}")
-        ax2.set_ylabel("Implied Volatility")
         ax2.set_xlabel("Expiration")
+        ax2.set_ylabel("Implied Volatility")
         st.pyplot(fig2)
 
     st.subheader("Call Implied Volatility Surface")
-    surface = (
-        surface_calls[["daysToExpiration", "strike", "impliedVolatility"]]
-        .pivot_table(values="impliedVolatility", index="strike", columns="daysToExpiration")
-        .dropna(axis=0, how="all")
-        .dropna(axis=1, how="all")
+
+    surface = surface_calls.pivot_table(
+        values="impliedVolatility",
+        index="strike",
+        columns="daysToExpiration"
     )
+
+    # Keep only rows/cols with enough information
+    surface = surface.dropna(thresh=3, axis=0)
+    surface = surface.dropna(thresh=2, axis=1)
 
     if surface.shape[0] > 1 and surface.shape[1] > 1:
         x = surface.columns.values
         y = surface.index.values
         z = surface.values
 
+        # Remove rows/cols that are entirely NaN after thresholding
         row_mask = ~np.all(np.isnan(z), axis=1)
         col_mask = ~np.all(np.isnan(z), axis=0)
 
@@ -133,11 +214,16 @@ try:
         x = x[col_mask]
 
         if z.shape[0] > 1 and z.shape[1] > 1:
+            # Fill remaining NaNs by linear interpolation across rows then columns
+            z_df = pd.DataFrame(z, index=y, columns=x)
+            z_df = z_df.interpolate(axis=0).interpolate(axis=1)
+            z = z_df.values
+
             X, Y = np.meshgrid(x, y)
 
-            fig3 = plt.figure(figsize=(10, 8))
+            fig3 = plt.figure(figsize=(10, 7))
             ax3 = fig3.add_subplot(111, projection="3d")
-            ax3.plot_surface(X, Y, z)
+            ax3.plot_surface(X, Y, z, linewidth=0, antialiased=True)
 
             ax3.set_xlabel("Days to expiration")
             ax3.set_ylabel("Strike price")
