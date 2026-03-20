@@ -13,7 +13,7 @@ st.header(
     "It is derived from the price of an option and can be used to gauge market sentiment and make informed trading decisions."
 )
 
-@st.cache_data
+@st.cache_data(ttl=600)
 def option_chains(ticker):
     asset = yf.Ticker(ticker)
     expirations = asset.options
